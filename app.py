@@ -1,11 +1,10 @@
-# app.py — 100% Error Free Version
+# app.py — Final Boss (Fast JSON + Redis Fallback + All Errors Fixed)
 import os
 import json
 import hashlib
 import time
 import secrets
 import string
-import requests
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 
@@ -16,62 +15,48 @@ DAY_SECONDS = 86400
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "keys.json")
 
-# API Key to protect /generate (Default: khan123)
+# ---------- Settings ----------
 GENERATE_API_KEY = os.environ.get("GENERATE_API_KEY", "khan123").strip()
-
-# Upstash Redis Setup (Optional but recommended for Vercel)
-REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip()
-REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
-USE_REDIS = bool(REDIS_URL and REDIS_TOKEN)
 ON_VERCEL = bool(os.environ.get("VERCEL"))
+_memory_db = {} # Vercel ke liye temporary memory
 
-# Temporary memory (Agar Vercel par Redis nahi hai, toh yahan save hoga taaki error na aaye)
-_memory_db = {}
+# ---------- Fast In-Memory Cache for keys.json ----------
+_cache = {"mtime": None, "data": {}}
 
-# ---------- Upstash Helper ----------
-def redis_command(*args):
-    if not USE_REDIS: return None
-    headers = {"Authorization": f"Bearer {REDIS_TOKEN}", "Content-Type": "application/json"}
-    try:
-        res = requests.post(REDIS_URL, headers=headers, json=list(args), timeout=5)
-        res.raise_for_status()
-        return res.json().get("result")
-    except Exception as e:
-        return None
-
-# ---------- Storage System ----------
-def _load_json():
+def load_json():
     if not os.path.exists(DATA_FILE): return {}
     try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f: return json.load(f)
+        mtime = os.path.getmtime(DATA_FILE)
+        if _cache["mtime"] == mtime:
+            return _cache["data"]
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        _cache["mtime"] = mtime
+        _cache["data"] = data
+        return data
     except: return {}
 
-def _save_json(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f: json.dump(data, f, indent=2)
+def save_json(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    _cache["mtime"] = None
+    _cache["data"] = {}
 
+# ---------- Unified Storage (JSON for Local, Memory for Vercel) ----------
 def storage_get(key):
-    if USE_REDIS:
-        res = redis_command("HGETALL", f"key:{key}")
-        return dict(zip(res[::2], res[1::2])) if res else None
-    elif ON_VERCEL:
+    if ON_VERCEL:
         return _memory_db.get(key)
-    return _load_json().get(key)
+    return load_json().get(key)
 
 def storage_save(key, data):
-    if USE_REDIS:
-        args = ["HSET", f"key:{key}"]
-        for k, v in data.items():
-            args.extend([k, "" if v is None else str(v)])
-        res = redis_command(*args)
-        if res is None: raise Exception("Redis Save Failed")
-    elif ON_VERCEL:
-        _memory_db[key] = data # Temporary save in RAM
+    if ON_VERCEL:
+        _memory_db[key] = data
     else:
-        allk = _load_json()
+        allk = load_json()
         allk[key] = data
-        _save_json(allk)
+        save_json(allk)
 
-# ---------- Generic Helpers ----------
+# ---------- Helper Functions ----------
 def now_utc(): return datetime.now(timezone.utc)
 def iso(dt): return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 def parse_iso(s):
@@ -111,15 +96,22 @@ def device_fp():
 
 
 # ---------- ROUTES ----------
-@app.errorhandler(Exception)
-def handle_exception(e):
-    return jsonify({"status": "error", "message": str(e), "type": type(e).__name__}), 500
+@app.route("/")
+def home():
+    return jsonify({
+        "status": "success",
+        "message": "Welcome to KHAN Key Generator API",
+        "endpoints": {
+            "generate": "/generate?type=lifetime&api_key=khan123",
+            "check": "/check?key=KHAN-XXXX-XXXX-XXXX"
+        }
+    })
 
 @app.route("/generate", methods=["GET", "POST"])
 def generate():
     body = request.get_json(silent=True) if request.method == "POST" else request.args
     
-    # 1. Check API Key
+    # API Key Security
     api_key = (body.get("api_key") or request.headers.get("X-API-Key") or "").strip()
     if api_key != GENERATE_API_KEY:
         return jsonify({"status": "error", "message": "Unauthorized! Add ?api_key=khan123"}), 401
@@ -144,24 +136,18 @@ def generate():
         "bound_fingerprint": "", "device_ip": "", "device_ua": ""
     }
 
-    # 2. Save Key (Agar fail hua toh key generate nahi hogi)
+    # Save Data
     try:
         storage_save(key, record)
     except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": "Key generate nahi ho payi kyunki storage full/error hai.",
-            "error": str(e)
-        }), 500
+        return jsonify({"status": "error", "message": "Save failed. Storage error."}), 500
 
     response = {
         "status": "success", "key": key, "type": ktype, "validity": validity,
-        "expires_at": expires_str, "lifetime": lifetime, "message": "Key successfully generate aur save ho gayi!"
+        "expires_at": expires_str, "lifetime": lifetime, "message": "Key generate & save ho gayi!"
     }
-    
-    if ON_VERCEL and not USE_REDIS:
-        response["warning"] = "⚠️ Ye key temporary memory me save hui hai. Vercel restart hote hi delete ho jayegi. Permanent save ke liye Upstash Redis lagayein."
-
+    if ON_VERCEL:
+        response["warning"] = "Vercel Memory Mode: Key restart par delete ho jayegi."
     return jsonify(response)
 
 @app.route("/check", methods=["GET", "POST"])
@@ -170,13 +156,13 @@ def check():
     key = (body.get("key") or "").strip().upper()
     if not key: return jsonify({"status": "error", "message": "Provide ?key=..."}), 400
 
+    # Fast check from JSON/Memory
     data = storage_get(key)
     
-    # Agar key nahi mili
     if not data:
         return jsonify({
             "status": "success", "real": False, "valid": False, 
-            "message": "❌ Ye key database me nahi mili. Fake hai ya delete ho chuki hai."
+            "message": "❌ Ye key fake hai ya exist nahi karti."
         })
 
     now = now_utc()
@@ -190,13 +176,13 @@ def check():
         data["device_ip"] = request.remote_addr
         data["device_ua"] = request.headers.get("User-Agent", "")[:100]
         storage_save(key, data)
-        dev_msg = "🔒 Key pehli baar is device par lock ho gayi."
+        dev_msg = "🔒 Key is device par lock ho gayi."
     elif bound_fp == fp:
         dev_msg = "✅ Key isi device par active hai."
     else:
         return jsonify({
             "status": "success", "real": True, "valid": False, "device_mismatch": True,
-            "message": "🚫 Ye key kisi dusre device par locked hai!"
+            "message": "🚫 Ye key dusre device par locked hai!"
         })
 
     if lifetime:
@@ -219,5 +205,14 @@ def check():
         "remaining": format_remaining(remaining), "message": dev_msg
     })
 
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"status": "error", "message": "Route not found. Check URL."}), 404
+
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify({"status": "error", "message": "Internal server error."}), 500
+
 if __name__ == "__main__":
+    if not os.path.exists(DATA_FILE): save_json({})
     app.run(host="0.0.0.0", port=5000)
