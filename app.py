@@ -1,12 +1,14 @@
-# app.py — Hybrid keys.json (local) + Upstash Redis (Vercel)
+# app.py — Vercel Ready (Bulletproof)
 import os
 import json
 import hashlib
 import time
 import secrets
 import string
+import requests
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, Response
+from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
 
@@ -16,23 +18,43 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "keys.json")
 
 # ---------- backend auto-detect ----------
-REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
-REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip()
+REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
 USE_REDIS = bool(REDIS_URL and REDIS_TOKEN)
-
-redis = None
-if USE_REDIS:
-    try:
-        from upstash_redis import Redis
-        redis = Redis(url=REDIS_URL, token=REDIS_TOKEN)
-    except Exception:
-        USE_REDIS = False
 
 ON_VERCEL = bool(os.environ.get("VERCEL"))
 MODE = "redis" if USE_REDIS else "json"
-if ON_VERCEL and not USE_REDIS:
-    print("⚠️  WARNING: Vercel par keys.json read-only hai. "
-          "UPSTASH_REDIS_REST_URL & TOKEN set karo, warna data persist nahi hoga.")
+
+
+# ---------- Global Error Handler (Vercel debug ke liye) ----------
+@app.errorhandler(Exception)
+def handle_exception(e):
+    if isinstance(e, HTTPException):
+        return e
+    return jsonify({
+        "status": "error",
+        "message": "Internal Server Error",
+        "error_details": str(e),
+        "type": type(e).__name__,
+        "fix_tip": "Check your Vercel Environment Variables and logs."
+    }), 500
+
+
+# ---------- Upstash REST API Helpers (No SDK needed) ----------
+def redis_command(*args):
+    if not USE_REDIS:
+        return None
+    headers = {
+        "Authorization": f"Bearer {REDIS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    try:
+        res = requests.post(REDIS_URL, headers=headers, json=list(args), timeout=5)
+        res.raise_for_status()
+        return res.json().get("result")
+    except Exception as e:
+        print(f"Redis Error: {e}")
+        return None
 
 
 # ---------- keys.json file helpers ----------
@@ -67,14 +89,18 @@ def _save_json(data):
 # ---------- unified storage API ----------
 def storage_get(key):
     if USE_REDIS:
-        d = redis.hgetall(f"key:{key}")
-        return d if d else None
+        res = redis_command("HGETALL", f"key:{key}")
+        if not res:
+            return None
+        return dict(zip(res[::2], res[1::2]))
     return _load_json().get(key)
 
 def storage_save(key, data):
     if USE_REDIS:
-        clean = {k: ("" if v is None else str(v)) for k, v in data.items()}
-        redis.hset(f"key:{key}", values=clean)
+        args = ["HSET", f"key:{key}"]
+        for k, v in data.items():
+            args.extend([k, "" if v is None else str(v)])
+        redis_command(*args)
     else:
         allk = _load_json()
         allk[key] = data
@@ -83,16 +109,20 @@ def storage_save(key, data):
 def storage_all():
     if USE_REDIS:
         out = {}
-        for k in redis.keys("key:*"):
-            d = redis.hgetall(k)
+        keys = redis_command("KEYS", "key:*")
+        if not keys:
+            return out
+        for k in keys:
+            key_name = k.replace("key:", "")
+            d = storage_get(key_name)
             if d:
-                out[d.get("key") or k.replace("key:", "")] = d
+                out[d.get("key") or key_name] = d
         return out
     return _load_json()
 
 def storage_delete(key):
     if USE_REDIS:
-        redis.delete(f"key:{key}")
+        redis_command("DEL", f"key:{key}")
     else:
         allk = _load_json()
         if key in allk:
@@ -114,15 +144,12 @@ def parse_iso(s):
         return None
 
 def is_true(v):
-    if v is None:
-        return False
-    if isinstance(v, bool):
-        return v
+    if v is None: return False
+    if isinstance(v, bool): return v
     return str(v).lower() in ("1", "true", "yes")
 
 def format_remaining(sec):
-    if sec <= 0:
-        return "0s"
+    if sec <= 0: return "0s"
     d, rem = divmod(sec, DAY_SECONDS)
     h, rem = divmod(rem, 3600)
     m, s = divmod(rem, 60)
@@ -134,13 +161,10 @@ def format_remaining(sec):
     return " ".join(parts)
 
 def normalize_type(raw):
-    if not raw:
-        return None
+    if not raw: return None
     v = raw.strip().lower()
-    if v in ("30", "30days", "30d", "30day", "month", "monthly", "one_month"):
-        return "30days"
-    if v in ("life", "lifetime", "life_time", "forever", "unlimited", "infinite", "inf"):
-        return "lifetime"
+    if v in ("30", "30days", "30d", "30day", "month", "monthly"): return "30days"
+    if v in ("life", "lifetime", "forever", "unlimited", "inf"): return "lifetime"
     return None
 
 def make_block():
@@ -177,20 +201,16 @@ def home():
     return jsonify({
         "status": "success",
         "app": "KHAN Key Generator",
-        "version": "3.0 (hybrid storage + device lock)",
         "storage_mode": MODE,
-        "storage_location": "Upstash Redis" if USE_REDIS else DATA_FILE,
+        "storage_location": "Upstash Redis REST" if USE_REDIS else DATA_FILE,
         "endpoints": {
             "generate_30days": "/generate?type=30days",
             "generate_lifetime": "/generate?type=lifetime",
             "check": "/check?key=KHAN-XXXX-XXXX-XXXX",
             "list": "/list",
-            "export_json": "/export    → saari keys keys.json ke roop me download",
-            "delete": "/delete?key=...&secret=ADMIN_SECRET"
-        },
-        "rules": "Ek key = ek device. Pehli /check par current device lock ho jata hai."
+            "export": "/export"
+        }
     })
-
 
 @app.route("/generate", methods=["GET", "POST"])
 def generate():
@@ -199,11 +219,7 @@ def generate():
     ktype = normalize_type(raw)
 
     if not ktype:
-        return jsonify({
-            "status": "error",
-            "message": "Invalid 'type'. Use '30days' or 'lifetime'.",
-            "example": "/generate?type=30days"
-        }), 400
+        return jsonify({"status": "error", "message": "Invalid 'type'. Use '30days' or 'lifetime'."}), 400
 
     key = make_new_key()
     created = now_utc()
@@ -224,57 +240,44 @@ def generate():
         "validity": validity,
         "created_at": iso(created),
         "expires_at": expires_str,
-        "lifetime": lifetime,
-        "bound_fingerprint": None,
-        "device_user_agent": None,
-        "device_ip": None,
-        "device_language": None,
-        "bound_at": None,
+        "lifetime": "1" if lifetime else "0",
+        "bound_fingerprint": "",
+        "device_user_agent": "",
+        "device_ip": "",
+        "device_language": "",
+        "bound_at": "",
     }
     storage_save(key, record)
 
     return jsonify({
         "status": "success",
-        "message": f"{validity} key generate ho gayi aur {MODE} storage me save ho gayi.",
+        "message": f"{validity} key generate ho gayi aur save ho gayi.",
         "storage": MODE,
         "key": key,
         "type": ktype,
         "validity": validity,
         "created_at": iso(created),
         "expires_at": expires_str,
-        "lifetime": lifetime,
-        "device_lock": "Pehli /check par current device lock ho jayega."
+        "lifetime": lifetime
     })
-
 
 @app.route("/check", methods=["GET", "POST"])
 def check():
     body = request.get_json(silent=True) if request.method == "POST" else request.args
     key = (body.get("key") or "").strip().upper()
     if not key:
-        return jsonify({
-            "status": "error",
-            "message": "Provide key via ?key=... or JSON {'key': 'KHAN-...'}"
-        }), 400
+        return jsonify({"status": "error", "message": "Provide key via ?key=..."}), 400
 
     data = storage_get(key)
 
     if not data:
-        return jsonify({
-            "status": "success",
-            "real": False,
-            "valid": False,
-            "expired": None,
-            "key": key,
-            "storage": MODE,
-            "message": "❌ Ye key FAKE hai / database me nahi mili."
-        })
+        return jsonify({"status": "success", "real": False, "valid": False, "key": key, "message": "❌ Key FAKE hai."})
 
     created = parse_iso(data.get("created_at") or "") or now_utc()
     now = now_utc()
     lifetime = is_true(data.get("lifetime"))
 
-    # ----- device lock -----
+    # Device lock
     fp = device_fp()
     bound_fp = data.get("bound_fingerprint") or ""
 
@@ -286,7 +289,6 @@ def check():
         data["device_language"] = info["language"]
         data["bound_at"] = iso(now)
         storage_save(key, data)
-        bound_fp = fp
         device_status = "NEWLY_BOUND"
         device_message = "🔒 Key pehli baar isi device par lock ho gayi."
     elif bound_fp == fp:
@@ -294,219 +296,66 @@ def check():
         device_message = "✅ Key isi device par already locked hai."
     else:
         return jsonify({
-            "status": "success",
-            "real": True,
-            "valid": False,
-            "expired": None,
-            "device_mismatch": True,
-            "key": key,
-            "bound_device": {
-                "user_agent": data.get("device_user_agent"),
-                "ip": data.get("device_ip"),
-                "language": data.get("device_language"),
-                "bound_at": data.get("bound_at"),
-            },
+            "status": "success", "real": True, "valid": False, "device_mismatch": True, "key": key,
+            "bound_device": {"ip": data.get("device_ip"), "ua": data.get("device_user_agent")},
             "current_device": device_info(),
-            "message": "🚫 Ye key kisi dusre device par locked hai. Is device par nahi chalegi."
+            "message": "🚫 Ye key kisi dusre device par locked hai."
         })
 
     dev_out = {
-        "user_agent": data.get("device_user_agent"),
         "ip": data.get("device_ip"),
-        "language": data.get("device_language"),
+        "user_agent": data.get("device_user_agent"),
         "bound_at": data.get("bound_at"),
-        "fingerprint": bound_fp[:12] + "...",
-        "status": device_status,
+        "status": device_status
     }
 
-    # ----- lifetime -----
     if lifetime:
-        age = int((now - created).total_seconds())
         return jsonify({
-            "status": "success",
-            "real": True,
-            "valid": True,
-            "expired": False,
-            "device_mismatch": False,
-            "storage": MODE,
-            "key": key,
-            "type": "lifetime",
-            "validity": "Lifetime",
-            "created_at": data.get("created_at"),
-            "expires_at": None,
-            "remaining_seconds": None,
-            "remaining_readable": "Lifetime — never expires",
-            "age_seconds": age,
-            "age_readable": format_remaining(age),
-            "device": dev_out,
-            "device_message": device_message,
-            "message": "✅ Key REAL aur ACTIVE hai. Lifetime — is device par hamesha chalegi."
+            "status": "success", "real": True, "valid": True, "expired": False, "key": key,
+            "type": "lifetime", "remaining_readable": "Lifetime",
+            "device": dev_out, "message": "✅ Lifetime key ACTIVE hai."
         })
 
-    # ----- 30 days -----
     expires = parse_iso(data.get("expires_at") or "")
-    if not expires:
-        return jsonify({
-            "status": "success",
-            "real": True,
-            "valid": False,
-            "expired": True,
-            "key": key,
-            "message": "Key record corrupted (missing expiry)."
-        })
-
-    remaining = int((expires - now).total_seconds())
+    remaining = int((expires - now).total_seconds()) if expires else 0
 
     if remaining <= 0:
         return jsonify({
-            "status": "success",
-            "real": True,
-            "valid": False,
-            "expired": True,
-            "device_mismatch": False,
-            "storage": MODE,
-            "key": key,
-            "type": data.get("type"),
-            "validity": data.get("validity"),
-            "created_at": data.get("created_at"),
-            "expires_at": data.get("expires_at"),
-            "remaining_seconds": 0,
-            "remaining_readable": "0s (expired)",
-            "device": dev_out,
-            "message": "⏰ Key REAL hai lekin EXPIRE ho chuki hai."
+            "status": "success", "real": True, "valid": False, "expired": True, "key": key,
+            "remaining_readable": "0s", "device": dev_out, "message": "⏰ Key EXPIRE ho chuki hai."
         })
 
-    d, rem = divmod(remaining, DAY_SECONDS)
-    h, rem = divmod(rem, 3600)
-    m, s = divmod(rem, 60)
-
     return jsonify({
-        "status": "success",
-        "real": True,
-        "valid": True,
-        "expired": False,
-        "device_mismatch": False,
-        "storage": MODE,
-        "key": key,
-        "type": data.get("type"),
-        "validity": data.get("validity"),
-        "created_at": data.get("created_at"),
-        "expires_at": data.get("expires_at"),
-        "remaining_seconds": remaining,
-        "remaining_days": d,
-        "remaining_hours": h,
-        "remaining_minutes": m,
-        "remaining_seconds_only": s,
+        "status": "success", "real": True, "valid": True, "expired": False, "key": key,
         "remaining_readable": format_remaining(remaining),
-        "device": dev_out,
-        "device_message": device_message,
-        "message": "✅ Key REAL aur ACTIVE hai. Time chal raha hai. Locked to this device."
+        "device": dev_out, "message": "✅ Key ACTIVE hai. Time chal raha hai."
     })
-
 
 @app.route("/list")
 def list_keys():
     allk = storage_all()
     now = now_utc()
     items = []
-
     for key, data in allk.items():
-        remaining = None
         lifetime = is_true(data.get("lifetime"))
+        rem = None
         if not lifetime and data.get("expires_at"):
             exp = parse_iso(data["expires_at"])
-            if exp:
-                remaining = max(0, int((exp - now).total_seconds()))
-
+            if exp: rem = max(0, int((exp - now).total_seconds()))
         items.append({
-            "key": key,
-            "type": data.get("type"),
-            "validity": data.get("validity"),
-            "created_at": data.get("created_at"),
-            "expires_at": data.get("expires_at") or None,
-            "remaining_seconds": remaining,
-            "remaining_readable": "Lifetime" if lifetime else (
-                format_remaining(remaining) if remaining is not None else None
-            ),
-            "device": {
-                "locked": bool(data.get("bound_fingerprint")),
-                "user_agent": data.get("device_user_agent") or None,
-                "ip": data.get("device_ip") or None,
-                "language": data.get("device_language") or None,
-                "bound_at": data.get("bound_at") or None,
-            }
+            "key": key, "type": data.get("type"), "expires_at": data.get("expires_at"),
+            "remaining": "Lifetime" if lifetime else (format_remaining(rem) if rem is not None else None),
+            "device_locked": bool(data.get("bound_fingerprint")),
+            "device_ip": data.get("device_ip")
         })
-
-    return jsonify({
-        "status": "success",
-        "storage": MODE,
-        "total": len(items),
-        "keys": items
-    })
-
+    return jsonify({"status": "success", "storage": MODE, "total": len(items), "keys": items})
 
 @app.route("/export")
 def export_json():
-    """
-    Poore database ko keys.json ke roop me download karo.
-    Local mode: keys.json se padhta hai.
-    Redis mode: Redis se padh kar keys.json file bana deta hai.
-    """
     allk = storage_all()
+    return Response(json.dumps(allk, indent=2), mimetype="application/json", headers={"Content-Disposition": 'attachment; filename="keys.json"'})
 
-    # local JSON ke liye native types
-    out = {}
-    for k, d in allk.items():
-        out[k] = {
-            "key": d.get("key") or k,
-            "type": d.get("type"),
-            "validity": d.get("validity"),
-            "created_at": d.get("created_at"),
-            "expires_at": d.get("expires_at") or None,
-            "lifetime": is_true(d.get("lifetime")),
-            "bound_fingerprint": d.get("bound_fingerprint") or None,
-            "device_user_agent": d.get("device_user_agent") or None,
-            "device_ip": d.get("device_ip") or None,
-            "device_language": d.get("device_language") or None,
-            "bound_at": d.get("bound_at") or None,
-        }
-
-    payload = json.dumps(out, indent=2, ensure_ascii=False)
-    return Response(
-        payload,
-        mimetype="application/json",
-        headers={"Content-Disposition": 'attachment; filename="keys.json"'}
-    )
-
-
-@app.route("/delete", methods=["GET", "POST"])
-def delete_key():
-    secret = os.environ.get("ADMIN_SECRET")
-    if not secret:
-        return jsonify({
-            "status": "error",
-            "message": "Delete disabled. Set ADMIN_SECRET env var."
-        }), 403
-
-    body = request.get_json(silent=True) if request.method == "POST" else request.args
-    if body.get("secret") != secret:
-        return jsonify({"status": "error", "message": "Invalid secret."}), 403
-
-    key = (body.get("key") or "").strip().upper()
-    if not key:
-        return jsonify({"status": "error", "message": "Missing key."}), 400
-
-    if not storage_get(key):
-        return jsonify({"status": "error", "message": "Key not found."}), 404
-
-    storage_delete(key)
-    return jsonify({"status": "success", "message": f"Key {key} delete ho gayi.", "storage": MODE})
-
-
-# ---------- bootstrap ----------
 if __name__ == "__main__":
-    if not USE_REDIS and not os.path.exists(DATA_FILE):
+    if not os.path.exists(DATA_FILE):
         _save_json({})
-        print(f"📁 Created {DATA_FILE}")
-    print(f"▶️  Storage mode: {MODE}")
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=5000, debug=False)
