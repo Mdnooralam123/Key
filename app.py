@@ -1,4 +1,4 @@
-# app.py — Vercel Ready (Bulletproof)
+# app.py — Vercel Ready (API Key Protected + Read-only Fixed)
 import os
 import json
 import hashlib
@@ -17,7 +17,11 @@ DAY_SECONDS = 86400
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "keys.json")
 
-# ---------- backend auto-detect ----------
+# ---------- Security: Generate karne ke liye API Key ----------
+# Default key 'khan123' hai. Aap Vercel me GENERATE_API_KEY env var set karke change kar sakte ho.
+GENERATE_API_KEY = os.environ.get("GENERATE_API_KEY", "khan123").strip()
+
+# ---------- Backend auto-detect ----------
 REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip()
 REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
 USE_REDIS = bool(REDIS_URL and REDIS_TOKEN)
@@ -26,7 +30,7 @@ ON_VERCEL = bool(os.environ.get("VERCEL"))
 MODE = "redis" if USE_REDIS else "json"
 
 
-# ---------- Global Error Handler (Vercel debug ke liye) ----------
+# ---------- Global Error Handler ----------
 @app.errorhandler(Exception)
 def handle_exception(e):
     if isinstance(e, HTTPException):
@@ -35,12 +39,11 @@ def handle_exception(e):
         "status": "error",
         "message": "Internal Server Error",
         "error_details": str(e),
-        "type": type(e).__name__,
-        "fix_tip": "Check your Vercel Environment Variables and logs."
+        "fix_tip": "Check your Vercel Environment Variables (UPSTASH_REDIS_REST_URL and TOKEN)."
     }), 500
 
 
-# ---------- Upstash REST API Helpers (No SDK needed) ----------
+# ---------- Upstash REST API Helpers ----------
 def redis_command(*args):
     if not USE_REDIS:
         return None
@@ -54,10 +57,10 @@ def redis_command(*args):
         return res.json().get("result")
     except Exception as e:
         print(f"Redis Error: {e}")
-        return None
+        raise Exception(f"Upstash Redis Error: {str(e)}. Check URL and Token.")
 
 
-# ---------- keys.json file helpers ----------
+# ---------- Local keys.json file helpers ----------
 _fc = {"mtime": None, "data": {}}
 
 def _load_json():
@@ -86,7 +89,7 @@ def _save_json(data):
     _fc["data"] = {}
 
 
-# ---------- unified storage API ----------
+# ---------- Unified Storage API ----------
 def storage_get(key):
     if USE_REDIS:
         res = redis_command("HGETALL", f"key:{key}")
@@ -102,6 +105,9 @@ def storage_save(key, data):
             args.extend([k, "" if v is None else str(v)])
         redis_command(*args)
     else:
+        if ON_VERCEL:
+            # Vercel par file system read-only hota hai, isliye crash hone se bachaya
+            raise PermissionError("Vercel par keys.json read-only hai. Upstash Redis env vars set karein.")
         allk = _load_json()
         allk[key] = data
         _save_json(allk)
@@ -119,15 +125,6 @@ def storage_all():
                 out[d.get("key") or key_name] = d
         return out
     return _load_json()
-
-def storage_delete(key):
-    if USE_REDIS:
-        redis_command("DEL", f"key:{key}")
-    else:
-        allk = _load_json()
-        if key in allk:
-            del allk[key]
-            _save_json(allk)
 
 
 # ---------- generic helpers ----------
@@ -202,19 +199,30 @@ def home():
         "status": "success",
         "app": "KHAN Key Generator",
         "storage_mode": MODE,
-        "storage_location": "Upstash Redis REST" if USE_REDIS else DATA_FILE,
-        "endpoints": {
-            "generate_30days": "/generate?type=30days",
-            "generate_lifetime": "/generate?type=lifetime",
-            "check": "/check?key=KHAN-XXXX-XXXX-XXXX",
-            "list": "/list",
-            "export": "/export"
-        }
+        "generate_requires_api_key": True,
+        "how_to_generate": "/generate?type=lifetime&api_key=YOUR_SECRET"
     })
 
 @app.route("/generate", methods=["GET", "POST"])
 def generate():
     body = request.get_json(silent=True) if request.method == "POST" else request.args
+    
+    # API Key Check
+    api_key = (body.get("api_key") or request.headers.get("X-API-Key") or "").strip()
+    if api_key != GENERATE_API_KEY:
+        return jsonify({
+            "status": "error",
+            "message": "Unauthorized! Valid 'api_key' is required.",
+            "hint": "Add ?api_key=YOUR_SECRET to the URL. Default secret is 'khan123' (change it via GENERATE_API_KEY env var)."
+        }), 401
+        
+    if ON_VERCEL and not USE_REDIS:
+        return jsonify({
+            "status": "error",
+            "message": "Storage Error: Vercel par keys.json read-only hai, isliye keys save nahi ho sakti!",
+            "fix": "Vercel Dashboard -> Settings -> Environment Variables me UPSTASH_REDIS_REST_URL aur UPSTASH_REDIS_REST_TOKEN add karein, phir Redeploy karein."
+        }), 500
+
     raw = (body.get("type") or body.get("plan") or "")
     ktype = normalize_type(raw)
 
