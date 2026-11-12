@@ -1,0 +1,7 @@
+{
+  "name": "maya-license-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Maya license, device trial (HWID), activation, admin and update API",
+  "scripts": {}
+}
