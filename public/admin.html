@@ -1,0 +1,22 @@
+<!DOCTYPE html><html lang="hi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Maya Admin</title>
+<style>body{font-family:system-ui,sans-serif;margin:16px;background:#f4f7fb;color:#12305a}h1{font-size:22px}.c{background:#fff;border-radius:12px;padding:14px;margin-bottom:12px;box-shadow:0 2px 8px #0001}input,select,textarea{width:100%;padding:10px;margin:4px 0;border:1px solid #b4ccea;border-radius:8px;font-size:15px}button{padding:10px 14px;border:0;border-radius:8px;background:#0a9df0;color:#fff;font-weight:700;margin:4px 4px 4px 0}button.r{background:#c62828}pre{white-space:pre-wrap;font-size:12px;background:#0d1533;color:#cfe0ff;padding:10px;border-radius:8px;max-height:260px;overflow:auto}</style></head><body>
+<h1>🛠 Maya Admin</h1>
+<div class="c"><h3>Pehle server URL</h3><input id="base" placeholder="https://tumhara-project.vercel.app"><button onclick="saveBase()">URL save karo</button><div id="bst" style="font-size:13px;margin-top:6px"></div></div>
+<div class="c"><label>Admin token (ek baar daalo, browser me save hoga)</label><input id="tok" type="password"><button onclick="saveTok()">Save</button></div>
+<div class="c"><h3>Naya key banao</h3><select id="kt"><option value="lifetime">Lifetime (hamesha)</option><option value="yearly">Yearly (365 din)</option><option value="monthly">Monthly (30 din)</option></select><input id="kk" placeholder="Custom key (khaali = auto)"><button onclick="mkKey()">Key banao</button><pre id="kout"></pre><button onclick="listKeys()">Saari keys dekho</button><pre id="klist"></pre></div>
+<div class="c"><h3>Devices (HWID)</h3><button onclick="listDev()">Devices load karo</button><pre id="dlist"></pre>
+<input id="dh" placeholder="HWID (list se copy karo)"><input id="dd" type="number" placeholder="Din (grant ke liye)" value="30"><button onclick="devAct('grant_days')">Premium do (din)</button><button onclick="devAct('reset_trial')">Trial reset</button><button class="r" onclick="devAct('revoke')">Band karo</button><button onclick="devAct('unrevoke')">Wapas chalu</button><pre id="dout"></pre></div>
+<div class="c"><h3>APK update bhejo</h3><input id="uv" type="number" placeholder="Version number (jaise 34)"><input id="ua" placeholder="APK link (https://...apk)"><textarea id="un" placeholder="Kya naya hai"></textarea><button onclick="pushUpd()">Update bhejo</button><pre id="uout"></pre></div>
+<script>
+const T=()=>localStorage.getItem("mtok")||"";
+const B=()=>(localStorage.getItem("mbase")||"").replace(/\/+$/,"");
+function saveBase(){const v=document.getElementById("base").value.trim().replace(/\/+$/,"");if(!/^https:\/\//.test(v)){bst.textContent="https:// se shuru hona chahiye";return}localStorage.setItem("mbase",v);bst.textContent="✅ Saved: "+v}
+function saveTok(){localStorage.setItem("mtok",document.getElementById("tok").value);alert("Saved")}
+async function api(path,opt={}){if(!B()){return {ok:false,message:"Pehle upar server URL save karo"}}let r;try{r=await fetch(B()+path,Object.assign({headers:{"Content-Type":"application/json","x-admin-token":T()}},opt))}catch(e){return {ok:false,message:"Network: "+e.message}}try{return await r.json()}catch(e){return {ok:false,message:"Server ne JSON nahi diya (URL ya deployment check karo)"}}}
+async function mkKey(){const b={type:kt.value};if(kk.value.trim())b.key=kk.value.trim();kout.textContent=JSON.stringify(await api("/api/admin/key",{method:"POST",body:JSON.stringify(b)}),null,2)}
+async function listKeys(){klist.textContent=JSON.stringify(await api("/api/admin/keys"),null,2)}
+async function listDev(){dlist.textContent=JSON.stringify(await api("/api/admin/devices"),null,2)}
+async function devAct(a){dout.textContent=JSON.stringify(await api("/api/admin/device",{method:"POST",body:JSON.stringify({hwid:dh.value.trim(),action:a,days:Number(dd.value)||30})}),null,2)}
+async function pushUpd(){uout.textContent=JSON.stringify(await api("/api/admin/update",{method:"POST",body:JSON.stringify({version:Number(uv.value),apk_url:ua.value.trim(),notes:un.value.trim()})}),null,2)}
+document.getElementById("tok").value=T();document.getElementById("base").value=B();bst.textContent=B()?("✅ Saved: "+B()):"Server URL abhi save nahi hai";
+</script></body></html>
